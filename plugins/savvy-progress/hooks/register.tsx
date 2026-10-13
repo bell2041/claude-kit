@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { AgentRun, Flow, Panel, Phase, PlannedTask } from '../types'
+import type { AgentRun, Flow, Panel, Phase, PlannedTask, ShellRun } from '../types'
 
 const flow = atom({ plugin: 'savvy-progress', key: 'flow' } as const, null)
 const agents = atom({ plugin: 'savvy-progress', key: 'agents' } as const, [])
@@ -9,8 +9,11 @@ const panel = atom({ plugin: 'savvy-progress', key: 'panel' } as const, {
   isCompact: false,
   isDoneCollapsed: false,
   autoOpenedFor: '',
+  isShellsDoneCollapsed: false,
 })
 const now = atom({ plugin: 'savvy-progress', key: 'now' } as const, 0)
+// SSH shells: a list of their own, so they never reach the agents' cost and token totals.
+const shells = atom({ plugin: 'savvy-progress', key: 'shells' } as const, [])
 
 const TOOL = 'mcp__savvy-progress__progress'
 const STEP_TOOL = 'mcp__savvy-progress__step'
@@ -75,6 +78,13 @@ const STRINGS = {
     review: 'Review',
     busy: 'running',
     ctx: 'ctx',
+    shells: 'Shells',
+    shellsDone: 'Finished shells',
+    background: 'background',
+    stopped: 'stopped',
+    interrupted: 'interrupted',
+    endedWithAgent: 'ended with its agent',
+    exitCode: 'exit',
     tier: { light: 'light', medium: 'medium', careful: 'careful', heavy: 'heavy', fable: 'fable', other: 'other' },
     effort: { low: 'low', medium: 'medium', high: 'high', xhigh: 'xhigh', max: 'max' },
   },
@@ -106,6 +116,13 @@ const STRINGS = {
     review: 'Ревью',
     busy: 'в работе',
     ctx: 'ctx',
+    shells: 'SSH-команды',
+    shellsDone: 'Завершённые SSH',
+    background: 'в фоне',
+    stopped: 'остановлена',
+    interrupted: 'прервана',
+    endedWithAgent: 'завершена вместе с агентом',
+    exitCode: 'код',
     tier: { light: 'light', medium: 'medium', careful: 'careful', heavy: 'heavy', fable: 'fable', other: 'other' },
     effort: { low: 'low', medium: 'medium', high: 'high', xhigh: 'xhigh', max: 'max' },
   },
@@ -137,6 +154,13 @@ const STRINGS = {
     review: 'בדיקה',
     busy: 'בעבודה',
     ctx: 'הקשר',
+    shells: 'פקודות SSH',
+    shellsDone: 'SSH שהסתיימו',
+    background: 'ברקע',
+    stopped: 'נעצרה',
+    interrupted: 'נקטעה',
+    endedWithAgent: 'הסתיימה עם הסוכן',
+    exitCode: 'קוד יציאה',
     tier: { light: 'קל', medium: 'בינוני', careful: 'זהיר', heavy: 'כבד', fable: 'פייבל', other: 'אחר' },
     effort: { low: 'נמוך', medium: 'בינוני', high: 'גבוה', xhigh: 'גבוה מאוד', max: 'מקסימלי' },
   },
@@ -761,6 +785,214 @@ const compactSvg = (W: number, list: AgentRun[], planned: Planned[], t: ReturnTy
   )
 }
 
+// ---------------------------------------------------------------------------
+// SSH shells: Bash calls that run ssh, scp, sftp, or rsync to a remote host.
+// Only what the command's own text says is read: a script that calls ssh inside
+// it is not seen.
+
+const MAX_SHELLS = 200
+const MAX_COMMAND = 72
+const MAX_LINE = 160
+// A background shell's output file is read whole, so it is read only up to this
+// size; past it the row shows elapsed time only.
+const MAX_TAIL_FILE = 4 * 1024 * 1024
+const SHELL_COLOR = '#4FA3C7'
+const SHELL_H = 50
+
+// The ssh family's word at a command's start or after a separator, a quote or a
+// path (`/usr/bin/ssh`), followed by a space: never `ssh-keygen` or `git push`.
+const SHELL_WORD = /(?:^|[\s;&|(`'"$])(?:[\w.~-]*\/)*(ssh|scp|sftp|rsync)(?=\s)/g
+// ssh options that take the next word as their value.
+const SSH_ARG_OPTS = new Set(['-B', '-b', '-c', '-D', '-E', '-e', '-F', '-I', '-i', '-J', '-L', '-l', '-m', '-O', '-o', '-p', '-P', '-Q', '-R', '-S', '-W', '-w'])
+// `[user@]host:path`, the remote side of scp and rsync; `host::` is rsync's daemon, not ssh.
+const REMOTE_PATH = /^(?:[^@/\s]+@)?(\[[^\]]+\]|[A-Za-z0-9._-]+):(?!:)/
+
+// The words after the ssh-family word, up to the end of that simple command. Quotes
+// group words; a quote that never closes is the one the command sits inside
+// (`zsh -lc "ssh anny uptime"`), so the command ends there.
+const wordsAfter = (rest: string): string[] => {
+  const words: string[] = []
+  let word = ''
+  let hasWord = false
+  for (let i = 0; i < rest.length; i++) {
+    const c = rest[i] ?? ''
+    if (c === "'" || c === '"') {
+      const close = rest.indexOf(c, i + 1)
+      if (close < 0) break
+      word += rest.slice(i + 1, close)
+      hasWord = true
+      i = close
+    } else if (c === '\\' && i + 1 < rest.length) {
+      word += rest[i + 1]
+      hasWord = true
+      i++
+    } else if (/[;&|)\n]/.test(c)) {
+      break
+    } else if (/\s/.test(c)) {
+      if (hasWord) words.push(word)
+      word = ''
+      hasWord = false
+    } else {
+      word += c
+      hasWord = true
+    }
+  }
+  if (hasWord) words.push(word)
+  return words
+}
+
+const hostOf = (target: string): string => {
+  const url = /^(?:ssh|sftp|scp):\/\/(?:[^@/]+@)?([^/:]+)/.exec(target)
+  if (url) return url[1] ?? ''
+  const bare = target.replace(/^[^@]+@/, '')
+  // `[::1]:path`: an IPv6 host keeps its colons.
+  const v6 = /^\[([^\]]+)\]/.exec(bare)
+  return v6 ? (v6[1] ?? '') : bare.replace(/:.*$/, '')
+}
+
+// ssh and sftp: the first word that is not an option or an option's value.
+const destinationOf = (words: string[]): string => {
+  for (let i = 0; i < words.length; i++) {
+    const w = words[i] ?? ''
+    if (w === '--') return words[i + 1] ?? ''
+    if (w.startsWith('-')) {
+      if (SSH_ARG_OPTS.has(w)) i++
+      continue
+    }
+    return w
+  }
+  return ''
+}
+
+// scp and rsync: the first `host:path` word, or an ssh-style URL.
+const remotePathOf = (words: string[]): string =>
+  words.find(w => !w.startsWith('-') && (REMOTE_PATH.test(w) || /^(?:scp|sftp|ssh):\/\//.test(w))) ?? ''
+
+const shortCommand = (s: string): string => clip(s.replace(/\s+/g, ' ').trim(), MAX_COMMAND)
+
+/** The first ssh-family call in a Bash command, with its host; null when none reaches a remote host over ssh. */
+const sshCallOf = (command: string): { host: string; command: string } | null => {
+  for (const m of command.matchAll(SHELL_WORD)) {
+    const tool = m[1] ?? ''
+    const start = (m.index ?? 0) + m[0].length - tool.length
+    const words = wordsAfter(command.slice(start + tool.length))
+    const target = tool === 'ssh' || tool === 'sftp' ? destinationOf(words) : remotePathOf(words)
+    // A local rsync, or an rsync:// daemon transfer, is not ssh: look further along.
+    if (!target || /^rsync:\/\//.test(target)) continue
+    const host = hostOf(target)
+    if (host) return { host, command: shortCommand(command.slice(start)) }
+  }
+  return null
+}
+
+const ANSI = /\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b[()][A-Za-z0-9]/g
+
+/** The last non-empty line of some output; rsync's progress lines end in `\r`, so both split. */
+const lastLineOf = (out: string): string => {
+  const lines = out
+    .slice(-8192)
+    .replace(ANSI, '')
+    .split(/[\r\n]+/)
+    .map(l => l.trim())
+    .filter(Boolean)
+  return clip(lines.at(-1) ?? '', MAX_LINE)
+}
+
+/** Progress read from one line: its last percentage, else its last N/M counter. */
+const progressOfLine = (line: string): Pick<ShellRun, 'percent' | 'countDone' | 'countTotal'> => {
+  const percents = [...line.matchAll(/(\d{1,3}(?:\.\d+)?)\s?%/g)].map(m => Number(m[1])).filter(n => n <= 100)
+  if (percents.length) return { percent: percents.at(-1) }
+  // A counter stands alone (`12/40`, `(3/8)`, `[3/8]`): `to-chk=10/50` and paths do not count.
+  const counts = [...line.matchAll(/(?:^|[\s([])(\d+)\s*\/\s*(\d+)(?=$|[\s)\],:])/g)]
+    .map(m => [Number(m[1]), Number(m[2])] as const)
+    .filter(([n, total]) => total > 0 && n <= total)
+  const last = counts.at(-1)
+  return last ? { countDone: last[0], countTotal: last[1] } : {}
+}
+
+// What the panel and the band read from a line of output.
+const tailOf = (out: string): Pick<ShellRun, 'lastLine' | 'percent' | 'countDone' | 'countTotal'> => {
+  const lastLine = lastLineOf(out)
+  return { lastLine: lastLine || undefined, percent: undefined, countDone: undefined, countTotal: undefined, ...progressOfLine(lastLine) }
+}
+
+// Bash's background result: "Output is being written to: <path>. You will be notified ...".
+const outputPathOf = (text: string | undefined): string | undefined => /Output is being written to: (\S+?)\.?(?:\s|$)/.exec(text ?? '')?.[1]
+
+// One `<task-notification>` block as the engine delivers it to the conversation.
+type TaskNote = { taskId?: string; toolUseId?: string; status?: string; exitCode?: number }
+
+const tagOf = (s: string, name: string): string | undefined => new RegExp(`<${name}>([\\s\\S]*?)</${name}>`).exec(s)?.[1]?.trim()
+
+const taskNotesOf = (text: string): TaskNote[] =>
+  [...text.matchAll(/<task-notification>([\s\S]*?)<\/task-notification>/g)].map(m => {
+    const body = m[1] ?? ''
+    const code = /exit code (-?\d+)/i.exec(tagOf(body, 'summary') ?? '')?.[1]
+    return { taskId: tagOf(body, 'task-id'), toolUseId: tagOf(body, 'tool-use-id'), status: tagOf(body, 'status'), exitCode: code === undefined ? undefined : Number(code) }
+  })
+
+// "45s", "3m12s", "1h02m": the band's and the shell rows' clock.
+const fmtDur = (ms: number): string => {
+  const s = Math.max(0, Math.floor(ms / 1000))
+  if (s < 60) return `${s}s`
+  const h = Math.floor(s / 3600)
+  const m = Math.floor((s % 3600) / 60)
+  return h ? `${h}h${String(m).padStart(2, '0')}m` : `${m}m${String(s % 60).padStart(2, '0')}s`
+}
+
+const shellElapsed = (r: ShellRun, at: number): number => (r.endedAt ?? Math.max(at, r.startedAt)) - r.startedAt
+
+// 0..1 when the output showed progress, else null: elapsed time only.
+const shellRatio = (r: ShellRun): number | null =>
+  r.percent !== undefined ? r.percent / 100 : r.countTotal ? (r.countDone ?? 0) / r.countTotal : null
+
+// "45%" or "12/40", the figure the bar was drawn from.
+const shellFigure = (r: ShellRun): string =>
+  r.percent !== undefined ? `${Math.round(r.percent)}%` : r.countTotal ? `${r.countDone ?? 0}/${r.countTotal}` : ''
+
+// Why a finished shell ended, as the row says it: "exit 255", "stopped", ...
+const shellEnd = (r: ShellRun): string => {
+  const s = tr()
+  if (r.endNote === 'stopped') return s.stopped
+  if (r.endNote === 'interrupted') return s.interrupted
+  if (r.endNote === 'agent') return s.endedWithAgent
+  return r.exitCode !== undefined && r.exitCode !== 0 ? `${s.exitCode} ${r.exitCode}` : ''
+}
+
+// The stats on a shell row's second line: figure, elapsed, background, how it ended.
+const shellStats = (r: ShellRun, at: number): string =>
+  [shellFigure(r), fmtDur(shellElapsed(r, at)), r.isBackground ? tr().background : '', r.status === 'running' ? '' : shellEnd(r)].filter(Boolean).join(' · ')
+
+// "ssh: 2 running · anny 3m12s", naming the shell that has run longest.
+const shellBandText = (live: ShellRun[], at: number): string => {
+  const oldest = live.reduce((a, b) => (b.startedAt < a.startedAt ? b : a))
+  const figure = shellFigure(oldest)
+  return `ssh: ${live.length} ${tr().isRunning} · ${oldest.host} ${fmtDur(shellElapsed(oldest, at))}${figure ? ' ' + figure : ''}`
+}
+
+const shellSvg = (W: number, r: ShellRun, at: number): string => {
+  const ratio = shellRatio(r)
+  const textW = W - 22
+  const stats = shellStats(r, at)
+  const statsW = textWidth(stats, 11)
+  const lineW = Math.max(0, textW - statsW - 12)
+  const hostW = Math.min(textWidth(r.host, 13) + 10, textW * 0.4)
+  const color = r.status === 'failed' ? '#D0453F' : SHELL_COLOR
+  const barW = textW
+  const fillW = ratio === null ? 0 : Math.round(barW * Math.min(1, ratio))
+  return svg(
+    W,
+    SHELL_H,
+    `<text class="t" ${startText(W, 0, 16, false)} font-family="${FONT}" font-size="13" font-weight="600">${xml(fitText(r.host, 13, hostW))}</text>
+<text class="s" ${startText(W, hostW + 4, 16, false)} font-family="${FONT}" font-size="11.5">${xml(fitText(r.command, 11.5, textW - hostW - 4))}</text>
+${r.lastLine && lineW > 30 ? `<text class="m" ${startText(W, 0, 33, false)} font-family="${FONT}" font-size="11">${xml(fitText(r.lastLine, 11, lineW))}</text>` : ''}
+<text class="s" ${endText(W, textW, 33, true)} font-family="${FONT}" font-size="11" font-variant-numeric="tabular-nums">${xml(stats)}</text>
+${ratio === null ? '' : `<rect class="k" x="${mx(W, 0, barW)}" y="40" width="${barW}" height="4" rx="2"/><rect x="${mx(W, 0, fillW)}" y="40" width="${fillW}" height="4" rx="2" fill="${color}"/>`}
+${statusMark(mx(W, W - 8), 12, r.status, SHELL_COLOR)}
+<line class="ln" x1="0" y1="${SHELL_H - 0.5}" x2="${W}" y2="${SHELL_H - 0.5}"/>`,
+  )
+}
+
 // --- terminal drawing: the same rows in text.
 
 const ctxBar = (pct: number, width: number): string => {
@@ -788,6 +1020,54 @@ async function autoOpen($: EngineInterface, key: string): Promise<void> {
   if (p.autoOpenedFor === key) return
   await update($, panel, prev => ({ ...prev, autoOpenedFor: key }))
   void $.ui.open({ id: PANE, title: tr().pane })
+}
+
+// A tick that is still reading files when the next one comes lets that one pass.
+// Module scope is fine: a reload starts it over with no read in flight.
+let isPolling = false
+
+// The output file of a background shell, read whole; text '' when it is too large, null when gone or unreadable.
+async function readOutput($: EngineInterface, path: string): Promise<{ text: string; mtimeMs: number } | null> {
+  try {
+    const st = await $.fs.stat(path)
+    if (st.kind !== 'file') return null
+    if (st.size > MAX_TAIL_FILE) return { text: '', mtimeMs: st.mtimeMs }
+    return { text: String(await $.fs.read(path)), mtimeMs: st.mtimeMs }
+  } catch {
+    return null
+  }
+}
+
+// Reads each running background shell's output file when it changed since the last read.
+async function pollShells($: EngineInterface): Promise<void> {
+  if (isPolling) return
+  isPolling = true
+  try {
+    const live = (await read($, shells)).filter(r => r.status === 'running' && r.outputPath)
+    for (const r of live) {
+      const st = await $.fs.stat(r.outputPath ?? '').catch(() => null)
+      if (!st || st.mtimeMs === r.outputMtime) continue
+      const out = await readOutput($, r.outputPath ?? '')
+      if (!out) continue
+      await update($, shells, list =>
+        list.map(x => (x.id === r.id && x.status === 'running' ? { ...x, ...(out.text ? tailOf(out.text) : {}), outputMtime: out.mtimeMs } : x)),
+      )
+    }
+  } finally {
+    isPolling = false
+  }
+}
+
+// Ends a shell row: its status, why, and the last of its output when it has a file.
+async function finishShell($: EngineInterface, match: (r: ShellRun) => boolean, end: Pick<ShellRun, 'status' | 'exitCode' | 'endNote'>): Promise<void> {
+  const row = (await read($, shells)).find(r => r.status === 'running' && match(r))
+  if (!row) return
+  const out = row.outputPath ? await readOutput($, row.outputPath) : null
+  const at = await $.clock.now()
+  await update($, shells, list =>
+    list.map(r => (r.id === row.id && r.status === 'running' ? { ...r, ...(out?.text ? tailOf(out.text) : {}), ...end, endedAt: at } : r)),
+  )
+  await update($, now, () => at)
 }
 
 export const register: Register = (on, options) => {
@@ -849,11 +1129,14 @@ export const register: Register = (on, options) => {
       description: 'Show or hide the panel of subagents: running, finished and planned, with model, context, cost and time',
     })
 
-    // Ticks the running agents' clocks; quiet when nothing runs.
+    // Ticks the running agents' and shells' clocks, and reads the background
+    // shells' output; quiet when nothing runs.
     $.clock.every(1000, () => {
       void (async () => {
         const list = await read($, agents)
-        if (!list.some(a => a.status === 'running')) return
+        const live = (await read($, shells)).filter(r => r.status === 'running')
+        if (!list.some(a => a.status === 'running') && !live.length) return
+        if (live.some(r => r.outputPath)) await pollShells($)
         const at = await $.clock.now()
         await update($, now, () => at)
       })()
@@ -920,6 +1203,89 @@ export const register: Register = (on, options) => {
     } finally {
       await update($, flow, prev => (prev ? { ...prev, running: Math.max(0, prev.running - 1) } : prev))
     }
+  })
+
+  // SSH shells: a Bash call whose command reaches a remote host gets a row in the panel.
+  on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
+    const input = e as unknown as { command?: string; run_in_background?: boolean; tool_use_id?: string }
+    const call = sshCallOf(String(input.command ?? ''))
+    if (!call) return next(e)
+
+    const at = await $.clock.now()
+    const id = input.tool_use_id || `shell-${at}`
+    await update($, shells, list =>
+      [
+        ...list.filter(r => r.id !== id),
+        { id, agentId: e.agentId, host: call.host, command: call.command, status: 'running' as const, isBackground: input.run_in_background === true, startedAt: at },
+      ].slice(-MAX_SHELLS),
+    )
+    await update($, now, () => at)
+
+    let result: Awaited<ReturnType<typeof next>> | undefined
+    try {
+      result = await next(e)
+      return result
+    } finally {
+      const end = await $.clock.now()
+      await update($, shells, list => {
+        // The call threw: the row ends as failed.
+        if (!result) return list.map(r => (r.id === id ? { ...r, status: 'failed' as const, endedAt: end } : r))
+        // Refused before it ran (a hook's deny): no row.
+        if (result.deny !== undefined) return list.filter(r => r.id !== id)
+        const out = (result.result ?? {}) as { stdout?: string; stderr?: string; interrupted?: boolean; backgroundTaskId?: string; backgroundEndsWithFinalResponse?: boolean }
+        return list.map((r): ShellRun => {
+          if (r.id !== id) return r
+          // Still running in the background (asked for, Ctrl+B, or past its timeout): the task notification ends it.
+          if (out.backgroundTaskId) {
+            return {
+              ...r,
+              isBackground: true,
+              taskId: out.backgroundTaskId,
+              outputPath: outputPathOf(result?.text),
+              endsWithAgent: out.backgroundEndsWithFinalResponse && e.agentId ? e.agentId : undefined,
+            }
+          }
+          const code = /^Exit code (-?\d+)/m.exec(result?.text ?? '')?.[1]
+          return {
+            ...r,
+            ...tailOf(out.stdout?.trim() ? out.stdout : out.stderr ?? result?.text ?? ''),
+            status: result?.isError || out.interrupted ? 'failed' : 'done',
+            exitCode: code === undefined ? undefined : Number(code),
+            endNote: out.interrupted ? 'interrupted' : undefined,
+            endedAt: end,
+          }
+        })
+      })
+      await update($, now, () => end)
+    }
+  })
+
+  // A background shell stopped by TaskStop is ended here; its notification, if one follows, finds nothing running.
+  on('tool.call', { tool: 'TaskStop' }, async ($, e, next) => {
+    const result = await next(e)
+    const input = e as unknown as { task_id?: string; shell_id?: string }
+    const taskId = input.task_id || input.shell_id
+    if (taskId && result.deny === undefined && !result.isError) await finishShell($, r => r.taskId === taskId, { status: 'failed', endNote: 'stopped' })
+    return result
+  })
+
+  // A background shell ends when its task notification reaches the conversation:
+  // `<task-notification><task-id>…</task-id><status>completed</status><summary>… (exit code 0)</summary>`.
+  on('session.append', async ($, e, next) => {
+    const result = await next(e)
+    const text = (e.message.content ?? []).map(b => (typeof b.text === 'string' ? b.text : typeof b.content === 'string' ? b.content : '')).join('\n')
+    if (!text.includes('<task-notification>')) return result
+    const running = (await read($, shells)).filter(r => r.status === 'running' && r.isBackground)
+    for (const note of taskNotesOf(text)) {
+      if (!running.some(r => (note.taskId && r.taskId === note.taskId) || (note.toolUseId && r.id === note.toolUseId))) continue
+      const isOk = note.status === 'completed' && (note.exitCode === undefined || note.exitCode === 0)
+      await finishShell($, r => (!!note.taskId && r.taskId === note.taskId) || (!!note.toolUseId && r.id === note.toolUseId), {
+        status: isOk ? 'done' : 'failed',
+        exitCode: note.exitCode,
+        endNote: note.status === 'killed' ? 'stopped' : undefined,
+      })
+    }
+    return result
   })
 
   on('agent.spawn', async ($, e, next) => {
@@ -1023,6 +1389,10 @@ export const register: Register = (on, options) => {
         }),
       )
       await update($, now, () => at)
+      // A synchronous subagent's background shells die with its final answer, and no notification follows.
+      if ((await read($, shells)).some(r => r.status === 'running' && r.endsWithAgent === agentId)) {
+        await update($, shells, list => list.map(r => (r.status === 'running' && r.endsWithAgent === agentId ? { ...r, status: 'failed', endNote: 'agent', endedAt: at } : r)))
+      }
     }
     return next(e)
   })
@@ -1034,12 +1404,17 @@ export const register: Register = (on, options) => {
     const list = await read($, agents)
     const f = await read($, flow)
     const p: Panel = await read($, panel)
-    const at = Math.max(await read($, now), ...list.map(a => a.startedAt), 0)
+    const sh = await read($, shells)
+    const at = Math.max(await read($, now), ...list.map(a => a.startedAt), ...sh.map(r => r.startedAt), 0)
 
     const running = list.filter(a => a.status === 'running').reverse()
     const finished = list.filter(a => a.status !== 'running').reverse()
     const planned = plannedOf(f, list)
+    // Totals are the agents' alone: shells cost no tokens.
     const t = totals(list, at)
+    const shellsLive = sh.filter(r => r.status === 'running').reverse()
+    const shellsDone = sh.filter(r => r.status !== 'running').reverse()
+    const isShellsDoneCollapsed = p.isShellsDoneCollapsed === true
     // The pane's title says "Agents"; inside, only the flow's own name.
     const title = f && !f.isFinished ? f.title : ''
 
@@ -1059,7 +1434,17 @@ export const register: Register = (on, options) => {
         onPress={() => update($, panel, prev => ({ ...prev, isDoneCollapsed: !prev.isDoneCollapsed }))}
       />
     )
-    const isEmpty = list.length === 0 && planned.length === 0
+    const toggleShellsDone = (
+      <Button
+        key="shells-done"
+        label={`${isShellsDoneCollapsed ? (isRtl() ? '◂' : '▸') : '▾'} ${s.shellsDone} · ${shellsDone.length}`}
+        plain
+        onPress={() => update($, panel, prev => ({ ...prev, isShellsDoneCollapsed: !prev.isShellsDoneCollapsed }))}
+      />
+    )
+    // The shells' heading counts the running ones; finished ones fold under their own toggle.
+    const shellsHeading = `${s.shells} · ${shellsLive.length} ${s.isRunning}`
+    const isEmpty = list.length === 0 && planned.length === 0 && sh.length === 0
     const summary = `≈${fmtCost(t.cost)}, ${fmtTokens(t.tokens)} ${s.tokensWord}, ${fmtTime(t.time)}`
 
     if (e.surface === 'desktop' && 'Svg' in ui) {
@@ -1077,13 +1462,25 @@ export const register: Register = (on, options) => {
         return (
           <Box flexDirection="column" gap={1} alignItems={align}>
             <Svg source={compactSvg(W, list, planned, t)} alt={`${list.length} ${s.agentsCount}, ${summary}`} width={W} height={32} />
+            {shellsLive.length > 0 && <Text dimColor>{shellBandText(shellsLive, at)}</Text>}
             {toggleCompact}
           </Box>
         )
       }
       const shownDone = p.isDoneCollapsed ? 0 : finished.length
-      const lines = 1 + (isEmpty ? 1 : 0) + (running.length > 0 ? 1 : 0) + (finished.length > 0 ? 1 : 0) + (planned.length > 0 ? 1 : 0)
-      const gridH = headerHeight(title) + lines * LINE_H + (running.length + shownDone) * 66 + planned.length * 46
+      const shownShells = shellsLive.length + (isShellsDoneCollapsed ? 0 : shellsDone.length)
+      const lines =
+        1 +
+        (isEmpty ? 1 : 0) +
+        (running.length > 0 ? 1 : 0) +
+        (finished.length > 0 ? 1 : 0) +
+        (planned.length > 0 ? 1 : 0) +
+        (sh.length > 0 ? 1 : 0) +
+        (shellsDone.length > 0 ? 1 : 0)
+      const gridH = headerHeight(title) + lines * LINE_H + (running.length + shownDone) * 66 + planned.length * 46 + shownShells * SHELL_H
+      const shellRow = (r: ShellRun) => (
+        <Svg key={r.id} source={shellSvg(W, r, at)} alt={`${r.host}: ${r.command}, ${shellStats(r, at)}`} width={W} height={SHELL_H} />
+      )
       return (
         <Box flexDirection="column">
           {/* The grid sizes the pane; the content is placed over it, as an
@@ -1108,6 +1505,10 @@ export const register: Register = (on, options) => {
             {planned.map(pl => (
               <Svg key={`plan-${pl.n}`} source={plannedSvg(W, pl)} alt={`${pl.n}. ${pl.title}: ${s.isPlanned}`} width={W} height={46} />
             ))}
+            {sh.length > 0 && section('h-shells', shellsHeading)}
+            {shellsLive.map(shellRow)}
+            {shellsDone.length > 0 && toggleShellsDone}
+            {!isShellsDoneCollapsed && shellsDone.map(shellRow)}
           </Box>
         </Box>
       )
@@ -1149,6 +1550,34 @@ export const register: Register = (on, options) => {
       )
     }
 
+    const shellLine = (r: ShellRun) => {
+      const ratio = shellRatio(r)
+      const color = r.status === 'failed' ? 'red' : r.status === 'done' ? 'green' : SHELL_COLOR
+      return (
+        <Box key={r.id} flexDirection="column" marginBottom={1}>
+          <Box flexDirection="row" gap={1}>
+            <Text color={SHELL_COLOR}>⇄</Text>
+            <Text bold>{r.host}</Text>
+            <Text dimColor wrap="truncate-end">
+              {r.command}
+            </Text>
+            <Text color={color}>{STATUS_GLYPH[r.status]}</Text>
+          </Box>
+          <Text wrap="truncate-end">
+            {'  '}
+            {ratio !== null && <Text color={color}>{ctxBar(ratio * 100, barW)} </Text>}
+            <Text dimColor>{shellStats(r, at)}</Text>
+          </Text>
+          {r.lastLine ? (
+            <Text dimColor wrap="truncate-end">
+              {'  '}
+              {r.lastLine}
+            </Text>
+          ) : null}
+        </Box>
+      )
+    }
+
     return (
       <Box flexDirection="column">
         <Box flexDirection="row" justifyContent="space-between">
@@ -1172,6 +1601,7 @@ export const register: Register = (on, options) => {
                 ◷{' '}
               </Text>
             ))}
+            {shellsLive.length > 0 && <Text color={SHELL_COLOR}>{shellBandText(shellsLive, at)}</Text>}
           </Text>
         ) : (
           <Box flexDirection="column" marginTop={1}>
@@ -1196,6 +1626,10 @@ export const register: Register = (on, options) => {
                 </Box>
               )
             })}
+            {sh.length > 0 && <Text dimColor>{shellsHeading}</Text>}
+            {shellsLive.map(shellLine)}
+            {shellsDone.length > 0 && toggleShellsDone}
+            {!isShellsDoneCollapsed && shellsDone.map(shellLine)}
           </Box>
         )}
       </Box>
@@ -1204,7 +1638,8 @@ export const register: Register = (on, options) => {
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     const f = await read($, flow)
-    if (f === null || e.props.hasSurvey) return next(e)
+    const shellsLive = (await read($, shells)).filter(r => r.status === 'running')
+    if ((f === null && !shellsLive.length) || e.props.hasSurvey) return next(e)
     // Draw this row with the other mods' bands beneath it. Claude Code's own placeholder ({ type: 'engine' }) is
     // never nested: the desktop drops a band that nests it.
     const drawn = await Promise.resolve(next(e)).catch(() => null)
@@ -1212,6 +1647,21 @@ export const register: Register = (on, options) => {
 
     const ui = $.ui.resolve(e)
     const { Box, Text, Button } = ui
+
+    // The ssh line sits under the flow's row, or alone when no flow runs; pressing it opens the panel.
+    // Reading `now` only while shells run keeps the flow's row from redrawing every second.
+    const at = shellsLive.length ? Math.max(await read($, now), ...shellsLive.map(r => r.startedAt)) : 0
+    const sshLine = shellsLive.length ? (
+      <Button key="savvy-shells" label={shellBandText(shellsLive, at)} plain onPress={() => void togglePane($)} />
+    ) : null
+    if (f === null) {
+      return (
+        <Box flexDirection="column">
+          {sshLine}
+          {below}
+        </Box>
+      )
+    }
     const list = await read($, agents)
     const crew = list.length + plannedOf(f, list).length
     const isWorking = list.some(a => a.status === 'running')
@@ -1242,6 +1692,7 @@ export const register: Register = (on, options) => {
             {crewButton}
             {dismiss}
           </Box>
+          {sshLine}
           {below}
         </Box>
       )
@@ -1264,6 +1715,7 @@ export const register: Register = (on, options) => {
           {crewButton}
           {dismiss}
         </Box>
+        {sshLine}
         {below}
       </Box>
     )

@@ -4,6 +4,9 @@ A Claude Code mod: a progress bar above the prompt and a live panel of subagents
 
 - **Progress bar**: the flow's title, phase, accepted tasks out of planned, and a button with the crew size that opens the panel. It appears once something reports progress (savvy-flow does) or a `savvy-*` worker starts.
 - **Agents panel** (`/agents-info` toggles it; `/agents-info open` opens it or brings it forward without toggling): running, finished and planned subagents with model, effort, task progress, context, estimated cost and time. Working crabs walk, and each savvy tier animates its prop: the astronaut floats, the detective sweeps the magnifier, the engineer turns the wrench, the chef tosses the omelette, the racer runs with a fluttering flag. `prefers-reduced-motion` stops them.
+- **SSH shells**: a Bash call whose command runs `ssh`, `scp`, `sftp` or `rsync` to a remote host gets a row under its own **Shells** heading in the panel: host, the command cut short, a running / ok / error mark, elapsed time, and the last line of output. A percentage (`rsync --info=progress2`, `pv -f`) or an `N/M` counter in that line draws a bar; otherwise the row shows elapsed time only. While any runs, a line above the prompt says `ssh: 2 running · anny 3m12s`, under the flow's bar when there is one; pressing it opens the panel. Shells are never counted in the agents' cost and token totals. Finished shells fold like finished agents, and the last 200 are kept.
+
+  What it can see: the command's own text (an `ssh` inside a script it calls is not seen). A foreground command's output reaches a mod only when it ends, so its last line and bar appear then; a background command (`run_in_background`, Ctrl+B, or one past its timeout) is followed live from its output file once a second and ends when its task notification arrives. `scp` and `pv` print no meter without a terminal (`pv -f` forces one).
 
 ## Tools it adds
 
